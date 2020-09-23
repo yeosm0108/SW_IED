@@ -20,6 +20,8 @@ void setup() {
      if(++count>10) break;
      delay(100);
    }
+  
+  while(1) {} // infinite loop
 }
 
 void loop() {
