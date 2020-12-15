@@ -18,25 +18,31 @@
 #define _DIST_ALPHA 0.3  //[3099] EMA 필터링을 위한 alpha 값
                // [3108] 0~1 사이의 값
 #define SEQ_SIZE 14
+#define SAMPLE_SIZE 50
+#define ERROR_NUM 10
 
 // Servo range
 #define _DUTY_MIN 800     //[3100] 최저 서보 위치
-#define _DUTY_NEU 1500   //[3100] 중립 서보 위치
+#define _DUTY_NEU 1500 //[3100] 중립 서보 위치
 #define _DUTY_MAX 2450     //[3100] 최대 서보 위치
 
 
 // Servo speed control
 #define _SERVO_ANGLE 30.0 
-#define _SERVO_SPEED 60.0 
+#define _SERVO_SPEED 100.0 
 
 // Event periods
 #define _INTERVAL_DIST 20 //[3099] 각 event 사이에 지정한 시간 간격
 #define _INTERVAL_SERVO 20
 #define _INTERVAL_SERIAL 100 
 
+// personal best : 4.7 0.005 175
+
+
 // PID parameters
-#define _KP 0.0035  //0.0028
-#define _KD 0.135                                                                                                                                                           
+#define _KP 4.7  //0.0028
+#define _KI 0.005
+#define _KD 177.5
 
 //////////////////////
 // global variables //
@@ -48,10 +54,11 @@ Servo myservo;
 // Distance sensor
 float dist_target; // location to send the ball
 float dist_raw, dist_ema; //[1928] 측정된 값과 ema 필터를 적용한 값
+float dist_sample[SAMPLE_SIZE];
 // sensor values
-float x[SEQ_SIZE] = {72.86, 94.80, 116.69, 135.19, 172.62, 194.20, 222.89, 248.91, 281.15, 293.65, 313.34, 328.55, 344.66, 353.08};
+float x[SEQ_SIZE] = {70.95, 91.93, 117.92, 137.06, 157.88, 171.98, 193.68, 211.40, 233.07, 252.89, 273.69, 293.09, 312.82, 327.44};
 // real values
-float y[SEQ_SIZE] = {100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 410};
+float y[SEQ_SIZE] = {100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425};
 
 // Event periods
 unsigned long last_sampling_time_dist, last_sampling_time_servo, last_sampling_time_serial; 
@@ -79,11 +86,14 @@ pinMode(PIN_LED,OUTPUT); // initialize GPIO pins
 
 // initialize global variables
 event_dist = event_servo = event_serial = false;
+dist_target = _DIST_TARGET;
+error_prev = error_curr = 0;
+iterm = 0;
 
 // move servo to neutral position
 myservo.writeMicroseconds(_DUTY_NEU);
 duty_curr = _DUTY_NEU;
-delay(1000);
+delay(450);
 // initialize serial port
 Serial.begin(57600);
 
@@ -124,20 +134,21 @@ if(time_curr >= last_sampling_time_serial + _INTERVAL_SERIAL ){
     // [3099] dist_ema?
 
   // PID control logic
-    error_curr = _DIST_TARGET - dist_ema;
-    pterm = error_curr;
-  // [3099]
-    iterm = 0;
-    dterm = error_curr - error_prev;
-    //control = pterm + dterm;
-    control = _KP * pterm +  iterm + _KD * dterm;
+    error_curr = dist_target - dist_ema;
+    pterm = _KP * error_curr;
+    iterm += _KI * error_curr;
+    if(error_prev == 0.0)
+      dterm = 0;
+    else
+      dterm = _KD * (error_curr - error_prev);
+    control = pterm + iterm + dterm;
 
     error_prev = error_curr;
 
   // duty_target = f(duty_neutral, control)
   //duty_target = ((control>0)?(_DUTY_MAX - _DUTY_NEU)*_SERVO_ANGLE / 180.0:(_DUTY_NEU - _DUTY_MIN) * _SERVO_ANGLE / 180.0) * control;
-  // [3099] 확실하지 않음, 비례이득의 비대칭 해결가능
-  duty_target = _DUTY_NEU + control * ((control>0)?(_DUTY_MAX - _DUTY_NEU):(_DUTY_NEU - _DUTY_MIN));
+
+  duty_target = _DUTY_NEU + control * ((control>0)?(_DUTY_MAX - _DUTY_NEU):(_DUTY_NEU - _DUTY_MIN)) / (_DUTY_MAX - _DUTY_NEU);
   // keep duty_target value within the range of [_DUTY_MIN, _DUTY_MAX]
     if(duty_target > _DUTY_MAX){
       duty_target = _DUTY_MAX;
@@ -165,22 +176,48 @@ if(time_curr >= last_sampling_time_serial + _INTERVAL_SERIAL ){
 
   if(event_serial) {
     event_serial = false; //[3117] // 이거 맞나요? // 저도 이렇게 했어요
-    Serial.print(",dist_ir:");
+    Serial.print("IR:");
     Serial.print(dist_raw);
-    Serial.print(",pterm:");
+    Serial.print(",T:");
+    Serial.print(dist_target);
+    Serial.print(",P:");
     Serial.print(map(pterm,-1000,1000,510,610));
-    Serial.print(",dterm:");
+    Serial.print(",D:");
     Serial.print(map(dterm,-1000,1000,510,610));
-    Serial.print(",duty_target:");
+    Serial.print(",I:");
+    Serial.print(map(iterm,-1000,1000,510,610));
+    Serial.print(",DTT:");
     Serial.print(map(duty_target,1000,2000,410,510));
-    Serial.print(",duty_curr:");
+    Serial.print(",DTC:");
     Serial.print(map(duty_curr,1000,2000,410,510));
-    Serial.println(",Min:100,Low:200,dist_target:255,High:310,Max:410");
+    Serial.println(",-G:245,+G:265,m:0,M:800");
   }
 }
 
 float ir_distance_filtered(void){ // return value unit: mm
-  dist_ema = _DIST_ALPHA * ir_distance_sequence() + (1 - _DIST_ALPHA) * dist_ema;
+  int i, j, k;
+  float value, sum = 0;
+
+  // get samples in a ascending order array
+  for(i=0; i< SAMPLE_SIZE; i++){
+    value = ir_distance_sequence();
+    for(j=0; j<i; j++){
+      if(dist_sample[j] > value)
+        break;
+    }
+    for(k=i; k > j; k--){
+      dist_sample[k] = dist_sample[k - 1];
+    }
+    dist_sample[j] = value;
+  }
+
+  // skip ERROR_NUM: inspired by #ir_filter_김태완
+  for(i=ERROR_NUM; i<SAMPLE_SIZE - ERROR_NUM; i++){
+    sum += dist_sample[i];
+  }
+  dist_raw = sum / (SAMPLE_SIZE - 2 * ERROR_NUM);
+  
+  dist_ema = _DIST_ALPHA * (sum / (SAMPLE_SIZE - 2 * ERROR_NUM)) + (1 - _DIST_ALPHA) * dist_ema;
   return dist_ema;
 }
 
